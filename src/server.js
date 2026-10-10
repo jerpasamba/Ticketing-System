@@ -20,7 +20,7 @@ class PgStore extends Store {
   async get(sid, cb) {
     try {
       const res = await db.prepare("SELECT sess FROM sessions WHERE sid = ? AND expire > ?").get(sid, new Date().toISOString());
-      cb(null, res ? res.sess : null);
+      cb(null, res ? (typeof res.sess === "string" ? JSON.parse(res.sess) : res.sess) : null);
     } catch(e) { cb(e); }
   }
   async set(sid, sess, cb) {

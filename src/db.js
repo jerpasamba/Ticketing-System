@@ -1,91 +1,90 @@
-if (!process.env.VERCEL) {
-  require("dotenv").config();
-}
-const { Pool } = require("pg");
-const { AsyncLocalStorage } = require("async_hooks");
+const Database = require("better-sqlite3");
+const path = require("path");
+const fs = require("fs");
+const bcrypt = require("bcryptjs");
 
-const txStorage = new AsyncLocalStorage();
-
-const DATABASE_URL = process.env.SUPABASE_DATABASE_URL || process.env.DATABASE_URL;
-
-if (!DATABASE_URL) {
-  console.error("FATAL: No database URL configured. Set SUPABASE_DATABASE_URL or DATABASE_URL.");
-}
-
-const pool = new Pool({
-  connectionString: DATABASE_URL || "postgresql://localhost:5432/notconfigured",
-  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
-  max: 3,
-  idleTimeoutMillis: 10000,
-  connectionTimeoutMillis: 8000,
-  allowExitOnIdle: true,
-});
-
-pool.on("error", (err) => {
-  console.error("Unexpected pool error:", err.message);
-});
-
-function convertPlaceholders(sql) {
-  let idx = 0;
-  const trimmed = sql.trim();
-  const isInsert = /^INSERT\s+INTO/i.test(trimmed);
-  const hasReturning = /RETURNING/i.test(trimmed);
-
-  const converted = sql.replace(/\?/g, () => `$${++idx}`);
-
-  let finalSql = converted;
-  if (isInsert && !hasReturning) {
-    finalSql = converted + " RETURNING id";
+const dataDir = path.join(__dirname, "..", "data");
+if (!fs.existsSync(dataDir)) {
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+  } catch (e) {
+    // ignore
   }
+}
 
-  return finalSql;
+const isPureMemory = process.env.CACHE_STORAGE === "memory" || process.env.VERCEL;
+const dbPath = isPureMemory ? ":memory:" : path.join(dataDir, "ticketing.db");
+
+let sqlite;
+try {
+  sqlite = new Database(dbPath);
+  if (!isPureMemory) {
+    sqlite.pragma("journal_mode = WAL");
+  }
+  sqlite.pragma("foreign_keys = ON");
+} catch (e) {
+  console.warn("Falling back to pure in-memory cache database:", e.message);
+  sqlite = new Database(":memory:");
+}
+
+// Custom functions
+sqlite.function("regexp_replace", (str, pattern, replacement) => {
+  if (typeof str !== "string") return "";
+  try {
+    return str.replace(new RegExp(pattern), replacement);
+  } catch (e) {
+    return str;
+  }
+});
+
+function translateSql(sql) {
+  return sql
+    .replace(/\$\d+/g, "?")
+    .replace(/\bcreated_at::date\b/gi, "substr(created_at, 1, 10)")
+    .replace(/EXTRACT\s*\(\s*EPOCH\s+FROM\s+NOW\(\)\s*\)/gi, "CAST(strftime('%s', 'now') AS REAL)")
+    .replace(/EXTRACT\s*\(\s*EPOCH\s+FROM\s+([a-zA-Z0-9_]+)\s*\)/gi, "CAST(strftime('%s', $1) AS REAL)")
+    .replace(/\bNOW\(\)/gi, "datetime('now')");
 }
 
 const stmtCache = new Map();
 
-function getCachedSql(sql) {
-  let cached = stmtCache.get(sql);
-  if (!cached) {
-    cached = convertPlaceholders(sql);
-    stmtCache.set(sql, cached);
+function getPreparedStatement(sql) {
+  let stmt = stmtCache.get(sql);
+  if (!stmt) {
+    const translated = translateSql(sql);
+    stmt = sqlite.prepare(translated);
+    stmtCache.set(sql, stmt);
   }
-  return cached;
-}
-
-function getExecutor() {
-  const txClient = txStorage.getStore();
-  return txClient || pool;
+  return stmt;
 }
 
 const db = {
   prepare(sql) {
-    const convertedSql = getCachedSql(sql);
+    const stmt = getPreparedStatement(sql);
     return {
       async run(...params) {
         try {
-          const result = await getExecutor().query(convertedSql, params);
-          const row = result.rows[0];
-          return { lastInsertRowid: row ? row.id : null, changes: result.rowCount };
+          const result = stmt.run(...params);
+          return { lastInsertRowid: result.lastInsertRowid, changes: result.changes };
         } catch (err) {
-          console.error("DB run error:", err.message);
+          console.error("Cache DB run error:", err.message, "SQL:", sql);
           throw err;
         }
       },
       async get(...params) {
         try {
-          const result = await getExecutor().query(convertedSql, params);
-          return result.rows[0] || null;
+          const result = stmt.get(...params);
+          return result !== undefined ? result : null;
         } catch (err) {
-          console.error("DB get error:", err.message);
+          console.error("Cache DB get error:", err.message, "SQL:", sql);
           throw err;
         }
       },
       async all(...params) {
         try {
-          const result = await getExecutor().query(convertedSql, params);
-          return result.rows || [];
+          return stmt.all(...params);
         } catch (err) {
-          console.error("DB all error:", err.message);
+          console.error("Cache DB all error:", err.message, "SQL:", sql);
           throw err;
         }
       },
@@ -93,44 +92,30 @@ const db = {
   },
 
   async exec(sql) {
-    try {
-      await getExecutor().query(sql);
-    } catch (err) {
-      console.error("DB exec error:", err.message);
-      throw err;
-    }
+    sqlite.exec(sql);
   },
 
   async query(sql, params = []) {
-    try {
-      const convertedSql = getCachedSql(sql);
-      const result = await getExecutor().query(convertedSql, params);
-      return result.rows;
-    } catch (err) {
-      console.error("DB query error:", err.message);
-      throw err;
-    }
+    const stmt = getPreparedStatement(sql);
+    return stmt.all(...params);
   },
 
   transaction(fn) {
     return async function (...args) {
-      const client = await pool.connect();
+      sqlite.exec("BEGIN");
       try {
-        await client.query("BEGIN");
-        const result = await txStorage.run(client, () => fn(...args));
-        await client.query("COMMIT");
+        const result = await fn(...args);
+        sqlite.exec("COMMIT");
         return result;
       } catch (e) {
-        await client.query("ROLLBACK");
+        sqlite.exec("ROLLBACK");
         throw e;
-      } finally {
-        client.release();
       }
     };
   },
 
   getPool() {
-    return pool;
+    return sqlite;
   },
 };
 
@@ -138,146 +123,225 @@ let initDone = false;
 
 async function initializeDatabase() {
   if (initDone) return;
-  if (!DATABASE_URL) throw new Error("No database URL configured");
 
-  const client = await pool.connect();
-  try {
-    const check = await client.query(
-      "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users') as exists"
-    );
-    if (check.rows[0].exists) {
-      initDone = true;
-      return;
-    }
-
-    await client.query(`
-      BEGIN;
-      CREATE TABLE IF NOT EXISTS sessions (sid TEXT PRIMARY KEY, sess JSON NOT NULL, expire TIMESTAMPTZ NOT NULL);
-      CREATE TABLE IF NOT EXISTS companies (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, slug TEXT, brand_color TEXT, logo_url TEXT, invite_required INTEGER NOT NULL DEFAULT 0, allowed_domains TEXT, status TEXT NOT NULL DEFAULT 'pending', plan TEXT NOT NULL DEFAULT 'starter', trial_ends_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
-      CREATE TABLE IF NOT EXISTS tickets (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, company_id INTEGER NOT NULL DEFAULT 1, user_id INTEGER, assignee_id INTEGER, status TEXT NOT NULL DEFAULT 'open', priority TEXT NOT NULL DEFAULT 'medium', priority_confidence REAL, priority_reason TEXT, sla_due_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
-      CREATE TABLE IF NOT EXISTS users (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, company_id INTEGER);
-      CREATE TABLE IF NOT EXISTS credentials (id BIGSERIAL PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS comments (id BIGSERIAL PRIMARY KEY, ticket_id INTEGER NOT NULL, user_id INTEGER NOT NULL, body TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
-      CREATE TABLE IF NOT EXISTS attachments (id BIGSERIAL PRIMARY KEY, ticket_id INTEGER NOT NULL, user_id INTEGER NOT NULL, original_name TEXT NOT NULL, stored_name TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
-      CREATE TABLE IF NOT EXISTS audit_logs (id BIGSERIAL PRIMARY KEY, actor_id INTEGER, company_id INTEGER, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id INTEGER, details TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
-      CREATE TABLE IF NOT EXISTS payment_requests (id BIGSERIAL PRIMARY KEY, company_id INTEGER NOT NULL, owner_id INTEGER NOT NULL, method TEXT NOT NULL, reference TEXT, amount TEXT, status TEXT NOT NULL DEFAULT 'pending', paid_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
-      CREATE TABLE IF NOT EXISTS invites (id BIGSERIAL PRIMARY KEY, company_id INTEGER NOT NULL, email TEXT, role TEXT NOT NULL DEFAULT 'requester', token_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ);
-      CREATE TABLE IF NOT EXISTS reset_tokens (id BIGSERIAL PRIMARY KEY, user_id INTEGER NOT NULL, token_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ);
-      CREATE TABLE IF NOT EXISTS plans (id BIGSERIAL PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL, price_usd INTEGER NOT NULL, price_php INTEGER NOT NULL, icon TEXT);
-      CREATE TABLE IF NOT EXISTS feedback (id BIGSERIAL PRIMARY KEY, user_id INTEGER, company_id INTEGER, message TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
-      COMMIT;
-    `);
-
-    await client.query(`
-      BEGIN;
-      CREATE INDEX IF NOT EXISTS idx_tickets_company_id ON tickets(company_id);
-      CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON tickets(user_id);
-      CREATE INDEX IF NOT EXISTS idx_tickets_assignee_id ON tickets(assignee_id);
-      CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
-      CREATE INDEX IF NOT EXISTS idx_tickets_company_status ON tickets(company_id, status);
-      CREATE INDEX IF NOT EXISTS idx_tickets_company_created ON tickets(company_id, created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_users_company_id ON users(company_id);
-      CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
-      CREATE INDEX IF NOT EXISTS idx_credentials_email ON credentials(email);
-      CREATE INDEX IF NOT EXISTS idx_credentials_user_id ON credentials(user_id);
-      CREATE INDEX IF NOT EXISTS idx_comments_ticket_id ON comments(ticket_id);
-      CREATE INDEX IF NOT EXISTS idx_attachments_ticket_id ON attachments(ticket_id);
-      CREATE INDEX IF NOT EXISTS idx_audit_logs_company_id ON audit_logs(company_id);
-      CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire);
-      CREATE INDEX IF NOT EXISTS idx_invites_company_id ON invites(company_id);
-      CREATE INDEX IF NOT EXISTS idx_reset_tokens_user_id ON reset_tokens(user_id);
-      CREATE INDEX IF NOT EXISTS idx_reset_tokens_expires ON reset_tokens(expires_at);
-      CREATE INDEX IF NOT EXISTS idx_payment_requests_company_id ON payment_requests(company_id);
-      CREATE INDEX IF NOT EXISTS idx_payment_requests_ref_method ON payment_requests(reference, method);
-      CREATE INDEX IF NOT EXISTS idx_companies_slug ON companies(slug);
-      COMMIT;
-    `);
-
-    const bcrypt = require("bcryptjs");
-
-    const companyResult = await client.query("SELECT COUNT(*)::int as count FROM companies");
-    if (companyResult.rows[0].count === 0) {
-      await client.query(
-        "INSERT INTO companies (name, status, plan, created_at) VALUES ($1, $2, $3, NOW())",
-        ["Acme", "active", "starter"]
-      );
-    }
-
-    await client.query(
-      "UPDATE companies SET slug = LOWER(REPLACE(name, ' ', '-')) WHERE slug IS NULL"
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      sid TEXT PRIMARY KEY,
+      sess TEXT NOT NULL,
+      expire TEXT NOT NULL
     );
 
-    const userResult = await client.query("SELECT COUNT(*)::int as count FROM users");
-    if (userResult.rows[0].count === 0) {
-      for (const [name, role] of [
-        ["Avery Kim", "requester"],
-        ["Jordan Lee", "requester"],
-        ["Riley Patel", "requester"],
-        ["Morgan Diaz", "agent"],
-        ["Casey Ortiz", "agent"],
-      ]) {
-        await client.query("INSERT INTO users (name, role) VALUES ($1, $2)", [name, role]);
-      }
-    }
+    CREATE TABLE IF NOT EXISTS companies (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      slug TEXT,
+      brand_color TEXT,
+      logo_url TEXT,
+      invite_required INTEGER NOT NULL DEFAULT 0,
+      allowed_domains TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      plan TEXT NOT NULL DEFAULT 'starter',
+      trial_ends_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
 
-    const firstCompany = await client.query("SELECT id FROM companies ORDER BY id LIMIT 1");
-    if (firstCompany.rows.length > 0) {
-      await client.query(
-        "UPDATE users SET company_id = $1 WHERE company_id IS NULL AND role != 'super_admin'",
-        [firstCompany.rows[0].id]
-      );
-    }
+    CREATE TABLE IF NOT EXISTS tickets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      company_id INTEGER NOT NULL DEFAULT 1,
+      user_id INTEGER,
+      assignee_id INTEGER,
+      status TEXT NOT NULL DEFAULT 'open',
+      priority TEXT NOT NULL DEFAULT 'medium',
+      priority_confidence REAL,
+      priority_reason TEXT,
+      sla_due_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
 
-    const credResult = await client.query("SELECT COUNT(*)::int as count FROM credentials");
-    if (credResult.rows[0].count === 0) {
-      const users = await client.query("SELECT id, name, role FROM users");
-      const passwordHash = "$2b$10$l.WyV73HE3EwPPxltruwxeQdDgLsb0YV4cPKUiArao3Bghh/eaedq";
-      for (const user of users.rows) {
-        const email = `${user.name.toLowerCase().replace(/\s+/g, ".")}@acme.test`;
-        await client.query(
-          "INSERT INTO credentials (user_id, email, password_hash) VALUES ($1, $2, $3)",
-          [user.id, email, passwordHash]
-        );
-      }
-    }
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      role TEXT NOT NULL,
+      company_id INTEGER
+    );
 
-    const superAdmin = await client.query("SELECT id FROM users WHERE role = 'super_admin' LIMIT 1");
-    if (superAdmin.rows.length === 0) {
-      await client.query("DELETE FROM credentials WHERE email = 'admin@platform.test'");
-      const result = await client.query(
-        "INSERT INTO users (name, role, company_id) VALUES ($1, $2, NULL) RETURNING id",
-        ["Platform Admin", "super_admin"]
-      );
-      const superId = result.rows[0].id;
-      await client.query(
-        "INSERT INTO credentials (user_id, email, password_hash) VALUES ($1, $2, $3)",
-        [superId, "admin@platform.test", "$2b$10$l.WyV73HE3EwPPxltruwxeQdDgLsb0YV4cPKUiArao3Bghh/eaedq"]
-      );
-    }
+    CREATE TABLE IF NOT EXISTS credentials (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL UNIQUE,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL
+    );
 
-    const planResult = await client.query("SELECT COUNT(*)::int as count FROM plans");
-    if (planResult.rows[0].count === 0) {
-      for (const [code, name, usd, php, icon] of [
-        ["starter", "Starter", 29, 1499, "🌱"],
-        ["growth", "Growth", 99, 4999, "🚀"],
-        ["enterprise", "Enterprise", 299, 14999, "🏢"],
-      ]) {
-        await client.query(
-          "INSERT INTO plans (code, name, price_usd, price_php, icon) VALUES ($1, $2, $3, $4, $5)",
-          [code, name, usd, php, icon]
-        );
-      }
-    }
+    CREATE TABLE IF NOT EXISTS comments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ticket_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
 
-    initDone = true;
-    console.log("Database initialized successfully.");
-  } catch (err) {
-    console.error("Database initialization error:", err.message);
-    throw err;
-  } finally {
-    client.release();
+    CREATE TABLE IF NOT EXISTS attachments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ticket_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      original_name TEXT NOT NULL,
+      stored_name TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      actor_id INTEGER,
+      company_id INTEGER,
+      action TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_id INTEGER,
+      details TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      company_id INTEGER NOT NULL,
+      owner_id INTEGER NOT NULL,
+      method TEXT NOT NULL,
+      reference TEXT,
+      amount TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      paid_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS invites (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      company_id INTEGER NOT NULL,
+      email TEXT,
+      role TEXT NOT NULL DEFAULT 'requester',
+      token_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS reset_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      token_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS plans (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      price_usd INTEGER NOT NULL,
+      price_php INTEGER NOT NULL,
+      icon TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS feedback (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      company_id INTEGER,
+      message TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  sqlite.exec(`
+    CREATE INDEX IF NOT EXISTS idx_tickets_company_id ON tickets(company_id);
+    CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON tickets(user_id);
+    CREATE INDEX IF NOT EXISTS idx_tickets_assignee_id ON tickets(assignee_id);
+    CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
+    CREATE INDEX IF NOT EXISTS idx_users_company_id ON users(company_id);
+    CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+    CREATE INDEX IF NOT EXISTS idx_credentials_email ON credentials(email);
+    CREATE INDEX IF NOT EXISTS idx_credentials_user_id ON credentials(user_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire);
+    CREATE INDEX IF NOT EXISTS idx_companies_slug ON companies(slug);
+  `);
+
+  // Seed plans
+  const planCount = sqlite.prepare("SELECT COUNT(*) as count FROM plans").get().count;
+  if (planCount === 0) {
+    const insertPlan = sqlite.prepare(
+      "INSERT INTO plans (code, name, price_usd, price_php, icon) VALUES (?, ?, ?, ?, ?)"
+    );
+    insertPlan.run("starter", "Starter", 29, 1499, "🌱");
+    insertPlan.run("growth", "Growth", 99, 4999, "🚀");
+    insertPlan.run("enterprise", "Enterprise", 299, 14999, "🏢");
   }
+
+  // Seed default company
+  const companyCount = sqlite.prepare("SELECT COUNT(*) as count FROM companies").get().count;
+  if (companyCount === 0) {
+    sqlite.prepare(
+      "INSERT INTO companies (name, slug, status, plan, created_at) VALUES (?, ?, ?, ?, datetime('now'))"
+    ).run("Acme", "acme", "active", "starter");
+  }
+
+  sqlite.prepare(
+    "UPDATE companies SET slug = LOWER(REPLACE(name, ' ', '-')) WHERE slug IS NULL"
+  ).run();
+
+  const firstCompany = sqlite.prepare("SELECT id FROM companies ORDER BY id LIMIT 1").get();
+  const companyId = firstCompany ? firstCompany.id : 1;
+
+  // Seed users
+  const userCount = sqlite.prepare("SELECT COUNT(*) as count FROM users").get().count;
+  if (userCount === 0) {
+    const insertUser = sqlite.prepare("INSERT INTO users (name, role, company_id) VALUES (?, ?, ?)");
+    insertUser.run("Avery Kim", "requester", companyId);
+    insertUser.run("Jordan Lee", "requester", companyId);
+    insertUser.run("Riley Patel", "requester", companyId);
+    insertUser.run("Morgan Diaz", "agent", companyId);
+    insertUser.run("Casey Ortiz", "agent", companyId);
+  }
+
+  // Seed credentials (password: password123)
+  const passwordHash = "$2b$10$h.YgIhwB0gSorPVnPew/Y.v83W/te35AYkvyM0xWbMG03iiOD4u5m";
+  const credCount = sqlite.prepare("SELECT COUNT(*) as count FROM credentials").get().count;
+  if (credCount === 0) {
+    const users = sqlite.prepare("SELECT id, name FROM users").all();
+    const insertCred = sqlite.prepare("INSERT INTO credentials (user_id, email, password_hash) VALUES (?, ?, ?)");
+    for (const u of users) {
+      const email = `${u.name.toLowerCase().replace(/\s+/g, ".")}@acme.test`;
+      insertCred.run(u.id, email, passwordHash);
+    }
+  }
+
+  // Seed platform admin
+  const superAdmin = sqlite.prepare("SELECT id FROM users WHERE role = 'super_admin' LIMIT 1").get();
+  if (!superAdmin) {
+    sqlite.prepare("DELETE FROM credentials WHERE email = ?").run("admin@platform.test");
+    const result = sqlite.prepare("INSERT INTO users (name, role, company_id) VALUES (?, ?, NULL)").run("Platform Admin", "super_admin");
+    sqlite.prepare("INSERT INTO credentials (user_id, email, password_hash) VALUES (?, ?, ?)").run(result.lastInsertRowid, "admin@platform.test", passwordHash);
+  }
+
+  // Seed sample tickets if empty
+  const ticketCount = sqlite.prepare("SELECT COUNT(*) as count FROM tickets").get().count;
+  if (ticketCount === 0) {
+    const agent = sqlite.prepare("SELECT id FROM users WHERE role = 'agent' AND company_id = ? LIMIT 1").get(companyId);
+    const requester = sqlite.prepare("SELECT id FROM users WHERE role = 'requester' AND company_id = ? LIMIT 1").get(companyId);
+    const agentId = agent ? agent.id : null;
+    const reqId = requester ? requester.id : 1;
+
+    const insertTicket = sqlite.prepare(`
+      INSERT INTO tickets (title, description, company_id, user_id, assignee_id, status, priority, priority_confidence, priority_reason, created_at, sla_due_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now', '+2 days'))
+    `);
+
+    insertTicket.run("Cannot connect to corporate VPN", "Unable to establish connection after router reboot. Getting timeout error.", companyId, reqId, agentId, "open", "high", 0.95, "Urgent remote work blocker");
+    insertTicket.run("Second monitor flickering over HDMI", "Display flashes black every 10 seconds. Tried switching cable.", companyId, reqId, agentId, "in_progress", "medium", 0.85, "Hardware display issue");
+    insertTicket.run("Password reset for finance dashboard", "Need reset link for monthly reports portal.", companyId, reqId, agentId, "resolved", "low", 0.99, "Account access request");
+  }
+
+  initDone = true;
+  console.log(`Cache storage initialized successfully (${isPureMemory ? "pure memory" : dbPath}).`);
 }
 
-module.exports = { db, pool, initializeDatabase };
+module.exports = { db, pool: sqlite, initializeDatabase };

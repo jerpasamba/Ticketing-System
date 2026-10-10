@@ -17,14 +17,6 @@ module.exports = async (req, res) => {
     return;
   }
 
-  if (!process.env.SUPABASE_DATABASE_URL && !process.env.DATABASE_URL) {
-    if (!res.headersSent) {
-      res.statusCode = 500;
-      res.setHeader("Content-Type", "text/plain");
-      res.end("Missing database URL. Set SUPABASE_DATABASE_URL or DATABASE_URL in Vercel environment variables.");
-    }
-    return;
-  }
 
   if (initError) {
     if (!res.headersSent) {

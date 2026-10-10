@@ -12,24 +12,25 @@ https://ticketing-system-8yho.onrender.com/
 
 ## Tech Stack
 - Node.js + Express (server-rendered HTML)
-- Postgres (Render managed database)
+- In-Memory & Local Cache (Zero database setup needed for demo)
 - Session-based auth + bcrypt
 - Multer for attachments
 
-## Local Development
+## Local Development (Demo Mode)
 1. Install dependencies
    - `npm install`
-2. Configure environment
-   - `DATABASE_URL=postgres://...`
-   - `SESSION_SECRET=your-secret`
-3. Start the server
+2. Start the server (no database configuration required!)
    - `npm run dev`
-4. Open `http://localhost:3000`
+3. Open `http://localhost:3000`
 
-## Default Logins (seeded)
-Use these after the first local boot:
+> [!NOTE]
+> Demo mode is cache-only with zero database setup required. All accounts, tickets, logins, and signups are stored directly in local cache/RAM.
+
+## Default Logins (Pre-seeded Demo Accounts)
 - Platform admin: `admin@platform.test` / `password123`
-- Sample users: `avery.kim@acme.test` / `password123`
+- Sample requester: `avery.kim@acme.test` / `password123`
+- Sample agent: `morgan.diaz@acme.test` / `password123`
+- Or use the "1-Click Demo" button on the login screen to jump straight in!
 
 ## Environment Variables
 - `DATABASE_URL` (required)
